@@ -4,7 +4,7 @@ Welcome! This is a **community repository**. That means YOU can push your own
 new features — custom generators, GLSL shaders, fixtures, and other assets.
 
 Please respect our Workflow, so we can see and verify your work. 
-Link your Pull Request to an Issue, and Push into its Branch. 
+Link your Pull Request to an Issue by Pushing into its Branch. 
 We only gonna verify Pull Requests Linked to an Ticket in the Verify Status.
 If the Assests are working we gonna Merge the Request.
 
