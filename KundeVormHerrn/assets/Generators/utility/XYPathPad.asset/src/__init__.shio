@@ -1,0 +1,240 @@
+ // XYPathPad generator (Math)
+ //
+ // An editable X/Y point field where every path point can be freely moved.
+ // The field is a signed range area: the graph spans -1..1 on both axes with a
+ // central "+" region (0..1) and a "-" region (-1..0) — graph space 0..1 is
+ // mapped to signed value -1..1 (0.5 == 0).
+ //
+ // A travelling point moves along the path once per time interval (speed =
+ // beats per full traversal). The clock can run FREE (free-running) or SYNC
+ // (locked to the timeline / beat).
+ //
+ // The point always starts at the first point and traverses forward along the
+ // line. Time is evenly distributed between each pair of consecutive points —
+ // each segment takes the same amount of time regardless of its length. After
+ // the last segment the point wraps back to the start and traverses forward
+ // again. There is no reverse/bounce pass.
+ //
+ // The X / Y value that the point reaches on the path is combined with the
+ // routable "Input X" / "Input Y" sliders and written to the "X" / "Y" output
+ // sliders (Regler) at the bottom:
+ //     out = clamp(Input + Strength * path_value, -1, 1)
+ // where path_value is the signed -1..1 position on the path.
+ //
+ // Shape ("Shape"):    CLOSED  -> the path is a closed loop with no distinct
+ //                                   start/end (last point connects back to the
+ //                                   first).
+ //                     OPEN    -> the path has a start and an end point.
+ //
+ // Path points use the standard graph point format: [[x, y, weight], ...]
+ // with x/y in 0..1 (graph space, mapped to -1..1 output).
+ //
+ import nanogui;
+  using eigen;
+
+ // Controls
+ path_graph = None;   // Editable point path in the signed X/Y field
+ speed      = None;   // Beats per full traversal (configurable interval)
+ phase      = None;   // Phase offset 0..1
+ clock_mode = None;   // 0 = FREE, 1 = SYNC
+ shape      = None;   // 0 = CLOSED, 1 = OPEN
+ in_x       = None;   // Base "Input X" (combined with path)
+ in_y       = None;   // Base "Input Y" (combined with path)
+ str_x      = None;   // Modulation strength for X
+ str_y      = None;   // Modulation strength for Y
+ out_x      = None;   // Output slider X (Regler)
+ out_y      = None;   // Output slider Y (Regler)
+
+ // Free-running clock state
+ free_time = 0.0;
+
+ // Map graph-space value (0..1) to the signed range (-1..1).
+ to_signed(v) {
+ 	return v * 2.0 - 1.0;
+ }
+
+ // Sample the path at position p (in "point units" 0..segments) and return
+ // [x, y] in signed -1..1 range.
+ //   shape:  0 = CLOSED (loop, no start/end)
+ //           1 = OPEN   (start + end point)
+ // The travelling point always moves forward from the start point along the
+ // line. Time is evenly distributed between each pair of consecutive points.
+ // After the last segment the point wraps back to the beginning.
+ sample_path(points, p, shape) {
+ 	n = points.size();
+ 	if(n == 0)
+ 		return [0.0, 0.0];
+ 	if(n == 1)
+ 		return [to_signed(points[0][0]), to_signed(points[0][1])];
+
+ 	// Number of segments. A closed path adds the wrap-back segment to point 0.
+ 	segments = n - 1;
+ 	if(shape == 0)
+ 		segments = n;
+
+ 	// Forward-only wrap into the segment range.
+ 	span = std.float(segments);
+ 	q = math.mod(p, span);
+
+ 	idx = math.floor(q);
+ 	if(idx >= span)
+ 		idx = span - 1.0;
+ 	frac = q - idx;
+
+ 	i0 = std.int(idx);
+ 	i1 = i0 + 1;
+ 	// For a closed path, the last segment wraps back to the first point.
+ 	if(shape == 0 && i1 >= n)
+ 		i1 = 0;
+
+ 	x0 = points[i0][0];
+ 	y0 = points[i0][1];
+ 	x1 = points[i1][0];
+ 	y1 = points[i1][1];
+
+ 	x = x0 + (x1 - x0) * frac;
+ 	y = y0 + (y1 - y0) * frac;
+
+ 	return [to_signed(x), to_signed(y)];
+ }
+
+ entry(generator, area) {
+ 	area.layout(nanogui.layout_vertical());
+
+ 	// ---- X/Y field: all points freely movable across the +/- range ----
+ 	path_box = area.widget().fixed_height(220);
+ 	path_graph = path_box.graph("X / Y  (-1 .. 1)").anchor(0);
+ 	path_graph.editable(true);
+ 	path_graph.allow_new_points(true);
+ 	// envelope_mode(true) enables interactive point placement (click to add /
+ 	// drag to move points), same as the working PathPad generator.
+ 	path_graph.envelope_mode(true);
+ 	// Closed path is drawn as a loop in the editor; the Shape setting controls
+ 	// the actual travel topology in sample_path().
+ 	path_graph.loop(true);
+ 	path_graph.grid(8.0);
+  // Default points are kept comfortably away from the left/right (and top/bottom)
+  // edges — graph space 0..1 maps to signed -1..1 with 0.5 == 0, so a value near
+  // 0.5 sits near the centre and values near 0.15/0.85 sit near the edges.
+  path_graph.points([[0.60, 0.35, 0.0], [0.80, 0.50, 0.0], [0.60, 0.65, 0.0], [0.35, 0.55, 0.0]]);
+
+  // Draw visible X / Y axis orientation lines. The graph spans 0..1 with the
+  // signed centre at 0.5: the X axis is the horizontal line at y = 0.5 and the
+  // Y axis is the vertical line at x = 0.5. This overlay is purely decorative.
+  path_graph.on_draw([path_graph]() {
+  	s = path_graph.size();
+  	ctx = nanogui.current_context();
+  	cx = s.x * 0.5;   // x = 0 (signed) -> graph 0.5
+  	cy = s.y * 0.5;   // y = 0 (signed) -> graph 0.5
+
+  	ctx.nvgBeginPath();
+  	// X axis (horizontal)
+  	ctx.nvgMoveTo(vec2f(0.0, cy));
+  	ctx.nvgLineTo(vec2f(s.x, cy));
+  	// Y axis (vertical)
+  	ctx.nvgMoveTo(vec2f(cx, 0.0));
+  	ctx.nvgLineTo(vec2f(cx, s.y));
+  	ctx.nvgStrokeWidth(1.5);
+  	ctx.nvgStrokeColor(vec4f(0.55, 0.75, 1.0, 0.55));
+  	ctx.nvgStroke();
+
+  	// Small axis labels for orientation.
+  	ctx.nvgFontFace("sans");
+  	ctx.nvgFontSize(11);
+  	ctx.nvgFillColor(vec4f(0.7, 0.85, 1.0, 0.9));
+  	ctx.nvgTextAlign(1 | 16);
+  	ctx.nvgText(vec2f(s.x - 14.0, cy - 4.0), "X");
+  	ctx.nvgText(vec2f(cx + 4.0, 12.0), "Y");
+  });
+
+ 	// ---- Clock / path settings ----
+ 	row1 = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+ 	speed      = row1.controlslider("Beats", "clock").min(0.5).max(16).value(2.0).fixed_width(110);
+ 	phase      = row1.controlslider("Phase", "clock").min(0).max(1).value(0.0).fixed_width(110);
+ 	clock_mode = row1.controlcombo("Mode", "clock").fixed_width(90);
+ 	clock_mode.items(["FREE", "SYNC"]);
+ 	shape = row1.controlcombo("Shape", "clock").fixed_width(110);
+ 	shape.items(["CLOSED", "OPEN"]);
+
+ 	// ---- Relative inputs: path is combined with InputX / InputY ----
+ 	row2 = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+ 	in_x  = row2.controlslider("Input X", "input").min(-1).max(1).value(0.0).fixed_width(140);
+ 	in_y  = row2.controlslider("Input Y", "input").min(-1).max(1).value(0.0).fixed_width(140);
+ 	str_x = row2.controlslider("Strength X", "input").min(-2).max(2).value(1.0).fixed_width(140);
+ 	str_y = row2.controlslider("Strength Y", "input").min(-2).max(2).value(1.0).fixed_width(140);
+
+ 	// ---- Output sliders (Regler) ----
+ 	out_row = area.widget().fixed_height(30).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+ 	out_x = out_row.controlslider("X", "out").min(-1).max(1).value(0.0).fixed_width(150);
+ 	out_y = out_row.controlslider("Y", "out").min(-1).max(1).value(0.0).fixed_width(150);
+ }
+
+ update(generator, tl_pos, pos_delta) {
+ 	px = 0.0;
+ 	py = 0.0;
+
+ 	pts = path_graph.points();
+ 	n = pts.size();
+ 	if(n == 1) {
+ 		px = to_signed(pts[0][0]);
+ 		py = to_signed(pts[0][1]);
+ 	}
+ 	else if(n >= 2) {
+ 		shp = 0;
+ 		if(shape.value() == 1)
+ 			shp = 1;
+
+ 		segments = n - 1;
+ 		if(shp == 0)
+ 			segments = n;
+ 		if(segments < 1)
+ 			segments = 1;
+
+ 		// Compute the path position p (in segment units) for the clock.
+ 		p = 0.0;
+ 		if(clock_mode.value() == 0) {
+ 			// FREE: free-running, pos_delta is in beats.
+ 			free_time = free_time + pos_delta / speed.value();
+ 			p = math.mod(free_time + phase.value(), 1.0) * std.float(segments);
+ 		}
+ 		else {
+ 			// SYNC: locked to the timeline (tl_pos is in beats).
+ 			p = math.mod(tl_pos / speed.value() + phase.value(), 1.0) * std.float(segments);
+ 		}
+
+ 		res = sample_path(pts, p, shp);
+ 		px = res[0];
+ 		py = res[1];
+ 	}
+
+ 	// Combine the reached path X/Y with InputX / InputY (scaled by strength)
+ 	// and output.
+ 	out_x.value(math.clamp(in_x.value() + str_x.value() * px, -1.0, 1.0));
+ 	out_y.value(math.clamp(in_y.value() + str_y.value() * py, -1.0, 1.0));
+ }
+
+ save_state() {
+ 	state = [speed=speed.value(), phase=phase.value(), clock=clock_mode.value(), shape=shape.value(), path=path_graph.points(), in_x=in_x.value(), in_y=in_y.value(), str_x=str_x.value(), str_y=str_y.value()];
+ 	return state;
+ }
+
+ load_state(state) {
+ 	if(state.has("speed"))
+ 		speed.value(state.speed);
+ 	if(state.has("phase"))
+ 		phase.value(state.phase);
+ 	if(state.has("clock"))
+ 		clock_mode.value(state.clock);
+ 	if(state.has("shape"))
+ 		shape.value(state.shape);
+ 	if(state.has("path"))
+ 		path_graph.points(state.path);
+ 	if(state.has("in_x"))
+ 		in_x.value(state.in_x);
+ 	if(state.has("in_y"))
+ 		in_y.value(state.in_y);
+ 	if(state.has("str_x"))
+ 		str_x.value(state.str_x);
+ 	if(state.has("str_y"))
+ 		str_y.value(state.str_y);
+ }
