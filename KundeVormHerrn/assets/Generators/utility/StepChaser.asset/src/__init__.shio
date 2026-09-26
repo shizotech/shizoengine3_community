@@ -1,0 +1,296 @@
+// StepChaser generator
+// A syncbar step sequencer. Each bar (Takt) is split into a configurable number
+// of count positions (Zaehlzeiten / steps). For every step you can either set a
+// target Value, or mark the step as HOLD (keep the previous value). When a step
+// boundary is reached the block's output slider is driven toward the step value
+// with a per-step FadeIn (attack) time, and released with a per-step FadeOut
+// time.
+//
+// Blocks are stacked below each other on the SAME grid, so each block exposes its
+// own output controlslider (multiple outputs). Each block's table has three rows:
+// Value, FadeOut, FadeIn. Columns are the steps and stay aligned across blocks.
+//
+// Timing is SYNC only (beat-locked): tl_pos is the timeline position in beats.
+import nanogui;
+
+// Global controls
+steps_ctrl = None;     // number of steps (Zaehlzeiten) per bar
+bar_ctrl = None;       // bar length in beats
+
+// Block bookkeeping
+block_max = 0;
+blocks = [];           // list of block records (json)
+managed block_list_area = None;
+
+// ---- Table cell layout constants ----
+cell_w = 70;           // width of a step cell (columns align across blocks)
+row_h = 26;            // height of a value row
+
+// Clamp a value into [0, 1].
+clamp01(v) {
+	if(v < 0.0)
+		return 0.0;
+	if(v > 1.0)
+		return 1.0;
+	return v;
+}
+
+// Rebuild the step columns of a block whenever the step count changes.
+rebuild_block(b) {
+	n = steps_ctrl.value();
+
+	// Tear down old cells
+	for(i = 0; i < b.cells.size(); i++)
+		std.free(b.cells[i].item);
+	b.cells.clear();
+
+	b.val = [];
+	b.fo = [];
+	b.fi = [];
+	b.hold = [];
+
+	// Column header strip: step number + a small hold toggle
+	b.header_row.clear_children();
+	for(i = 0; i < n; i++) {
+		col = b.header_row.widget().fixed_width(cell_w).fixed_height(34).layout(nanogui.layout_vertical());
+		std_num_label = col.label(std.string(i + 1));
+		hold_btn = col.controlbutton("H" + std.string(i + 1), "hold_" + b.id + "_" + std.string(i));
+		hold_btn.fixed_width(cell_w).fixed_height(22);
+		hbtn = hold_btn.get_button();
+		hbtn.on_click([b, i]() {
+			b.hold[i] = !b.hold[i];
+		});
+		b.hold.push_back(false);
+		b.cells.push_back([item=col]);
+	}
+
+	// Build one row of controlfloat cells for a given row id.
+	build_row(b, row_name, n) {
+		roww = b.rows[row_name];
+		roww.clear_children();
+		listref = b[row_name];
+		listref.clear();
+		for(i = 0; i < n; i++) {
+			cf = roww.controlfloat(row_name + std.string(i + 1), b.id + "_" + row_name + "_" + std.string(i));
+			cf.fixed_width(cell_w).fixed_height(row_h);
+			listref.push_back(cf);
+		}
+	}
+
+	build_row(b, "val", n);
+	build_row(b, "fo", n);
+	build_row(b, "fi", n);
+
+	// Defaults for new cells
+	for(i = 0; i < n; i++) {
+		b.val[i].value(1.0);
+		b.fo[i].value(0.05);
+		b.fi[i].value(0.01);
+	}
+}
+
+// Add a new block (a table on the shared grid + its own output slider).
+add_block() {
+	bid = "B" + block_max;
+
+	b = [id=bid, val=[], fo=[], fi=[], hold=[], cells=[], prev_out=0.0, out=None];
+
+	block_box = block_list_area.collapsable("Output " + std.string(block_max + 1)).expanded(true);
+	inner = block_box.content().layout(nanogui.layout_vertical());
+
+	b.header_row = inner.widget().fixed_height(34).anchor_left(0).layout(nanogui.layout_horizontal());
+
+	b.val_row = inner.widget().fixed_height(row_h).anchor_left(0).layout(nanogui.layout_horizontal());
+	b.fo_row = inner.widget().fixed_height(row_h).anchor_left(0).layout(nanogui.layout_horizontal());
+	b.fi_row = inner.widget().fixed_height(row_h).anchor_left(0).layout(nanogui.layout_horizontal());
+
+	b.rows = [header=b.header_row, val=b.val_row, fo=b.fo_row, fi=b.fi_row];
+
+	// Output slider (Regler) for this block
+	out_row = inner.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	inner.label("Value").fixed_width(cell_w);
+	out = out_row.controlslider("Out " + std.string(block_max + 1), "out_" + bid);
+	out.min(0).max(1).value(0.0);
+	b.out = out;
+
+	rebuild_block(b);
+
+	blocks.push_back(b);
+	block_max++;
+}
+
+entry(generator, area) {
+	area.layout(nanogui.layout_vertical());
+
+	// Global step / bar controls
+	top = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	steps_ctrl = top.controlslider("Steps").min(1).max(16).value(4).fixed_width(110);
+	bar_ctrl = top.controlslider("Bar").min(1).max(16).value(4).fixed_width(110);
+
+	// Row legend labels
+	top.widget().fixed_width(90).label("Value / FadeOut / FadeIn").fixed_height(24);
+
+	add_btn = area.button("ADD BLOCK");
+	del_btn = area.button("REMOVE BLOCK");
+
+	// Scrollable stack of blocks
+	vs = area.vscroll();
+	block_list_area = vs.content().layout(nanogui.layout_vertical());
+	steps_ctrl.callback([steps_ctrl]() {
+		for(i = 0; i < blocks.size(); i++)
+			rebuild_block(blocks[i]);
+	});
+
+	add_btn.on_click([]() {
+		if(block_max < 8)
+			add_block();
+	});
+
+	del_btn.on_click([blocks]() {
+		if(blocks.size() == 0)
+			return;
+		b = blocks.pop_back();
+		std.free(b.out);
+		for(i = 0; i < b.cells.size(); i++)
+			std.free(b.cells[i].item);
+		block_max--;
+	});
+
+	// Default blocks
+	add_block();
+	add_block();
+}
+
+update(generator, tl_pos, pos_delta) {
+	n = steps_ctrl.value();
+	if(n < 1)
+		n = 1;
+
+	bar_len = bar_ctrl.value();
+	if(bar_len < 0.001)
+		bar_len = 0.001;
+	step_dur = bar_len / std.float(n);
+
+	// Position within the current bar (beats), 0..bar_len
+	bar_pos = tl_pos - math.floor(tl_pos / bar_len) * bar_len;
+
+	step = std.int(math.floor(bar_pos / step_dur));
+	if(step >= n)
+		step = n - 1;
+	if(step < 0)
+		step = 0;
+	local = bar_pos - std.float(step) * step_dur;
+
+	for(bi = 0; bi < blocks.size(); bi++) {
+		b = blocks[bi];
+
+		// Guard against a block that has no cells (e.g. mid-rebuild)
+		if(b.val.size() <= step) {
+			b.out.value(b.prev_out);
+			continue;
+		}
+
+		fi = b.fi[step].value();
+		fo = b.fo[step].value();
+
+		// Keep fade times within the step duration
+		if(fi < 0.0)
+			fi = 0.0;
+		if(fo < 0.0)
+			fo = 0.0;
+		if(fi + fo > step_dur) {
+			scale = (fi + fo > 0.0) ? step_dur / (fi + fo) : 1.0;
+			fi = fi * scale;
+			fo = fo * scale;
+		}
+
+		out_val = 0.0;
+		if(b.hold[step]) {
+			// HOLD: keep the previous output value, no gate.
+			out_val = b.prev_out;
+		}
+		else {
+			target = clamp01(b.val[step].value());
+			hold_dur = step_dur - fi - fo;
+			if(fi > 0.0 && local < fi) {
+				// FadeIn from the previous value into the target.
+				out_val = b.prev_out + (target - b.prev_out) * (local / fi);
+			}
+			else if(local < fi + hold_dur) {
+				// Hold the target.
+				out_val = target;
+			}
+			else {
+				// FadeOut toward 0.
+				rem = step_dur - local;
+				frac = (fo > 0.0) ? (rem / fo) : 0.0;
+				if(frac < 0.0)
+					frac = 0.0;
+				if(frac > 1.0)
+					frac = 1.0;
+				out_val = target * frac;
+			}
+			out_val = clamp01(out_val);
+			b.prev_out = out_val;
+		}
+
+		b.out.value(out_val);
+	}
+}
+
+save_state() {
+	state = [steps=steps_ctrl.value(), bar=bar_ctrl.value(), blocks=[]];
+	for(bi = 0; bi < blocks.size(); bi++) {
+		b = blocks[bi];
+		rec = [val=[], fo=[], fi=[], hold=[], out=b.out.value()];
+		for(i = 0; i < b.val.size(); i++) {
+			rec.val.push_back(b.val[i].value());
+			rec.fo.push_back(b.fo[i].value());
+			rec.fi.push_back(b.fi[i].value());
+			rec.hold.push_back(b.hold[i]);
+		}
+		state.blocks.push_back(rec);
+	}
+	return state;
+}
+
+load_state(state) {
+	if(state.has("bar"))
+		bar_ctrl.value(state.bar);
+	// Rebuild blocks from saved data (steps applied after, to size the cells).
+	if(state.has("blocks")) {
+		saved_steps = steps_ctrl.value();
+		if(state.has("steps"))
+			steps_ctrl.value(state.steps);
+
+		// Tear down existing blocks
+		for(bi = 0; bi < blocks.size(); bi++) {
+			b = blocks[bi];
+			for(i = 0; i < b.cells.size(); i++)
+				std.free(b.cells[i].item);
+		}
+		blocks.clear();
+		block_max = 0;
+
+		for(bi = 0; bi < state.blocks.size(); bi++) {
+			add_block();
+			b = blocks[blocks.size() - 1];
+			rec = state.blocks[bi];
+			for(i = 0; i < rec.val.size(); i++) {
+				if(i < b.val.size()) {
+					b.val[i].value(rec.val[i]);
+					b.fo[i].value(rec.fo[i]);
+					b.fi[i].value(rec.fi[i]);
+					b.hold[i] = rec.hold[i];
+				}
+			}
+			if(rec.has("out"))
+				b.out.value(rec.out);
+		}
+	}
+	else if(state.has("steps")) {
+		steps_ctrl.value(state.steps);
+		for(bi = 0; bi < blocks.size(); bi++)
+			rebuild_block(blocks[bi]);
+	}
+}
