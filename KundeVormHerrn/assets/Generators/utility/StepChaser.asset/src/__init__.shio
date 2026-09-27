@@ -36,6 +36,8 @@ pending_rebuild = false;
 // ---- Table cell layout constants ----
 cell_w = 70;           // width of a step cell (columns align across blocks)
 row_h = 26;            // height of a value row
+header_h = 56;         // height of the step header (number + mode control)
+hold_btn_h = 28;       // height of the CHANGE/HOLD option control (must fit its caption)
 
 // Clamp a value into [0, 1].
 clamp01(v) {
@@ -44,6 +46,21 @@ clamp01(v) {
 	if(v > 1.0)
 		return 1.0;
 	return v;
+}
+
+// ---- Hold mode (CHANGE / HOLD) ----
+// The mode is stored per step in b.hold[i]; the UI widget is a normal option
+// control (controlcombo) with the two modes as items, so it never springs back
+// like a momentary button would. These helpers keep data and UI in sync.
+hold_mode_items = ["CHANGE", "HOLD"];
+
+// Set the hold mode of one step and update the option control (no callback loop).
+set_hold_mode(b, i, on) {
+	if(i >= b.hold.size())
+		return;
+	b.hold[i] = on ? true : false;
+	if(i < b.hmode.size())
+		b.hmode[i].value(on ? 1 : 0, false, false);
 }
 
 // Rebuild the step columns of a block whenever the step count changes.
@@ -59,19 +76,25 @@ rebuild_block(b) {
 	b.fo = [];
 	b.fi = [];
 	b.hold = [];
+	b.hmode = [];
 
-	// Column header strip: step number + a small hold toggle
+	// Column header strip: step number + the mode option control.
+	// The header must be tall enough for the number label AND the full control,
+	// otherwise only the top pixels of the control would be visible.
 	b.header_row.clear_children();
 	for(i = 0; i < n; i++) {
-		col = b.header_row.widget().fixed_width(cell_w).fixed_height(34).layout(nanogui.layout_vertical());
-		std_num_label = col.label(std.string(i + 1));
-		hold_btn = col.controlbutton("H" + std.string(i + 1), "hold_" + b.id + "_" + std.string(i));
-		hold_btn.fixed_width(cell_w).fixed_height(22);
-		hbtn = hold_btn.get_button();
-		hbtn.on_click([b, i]() {
-			b.hold[i] = !b.hold[i];
+		col = b.header_row.widget().fixed_width(cell_w).fixed_height(header_h).layout(nanogui.layout_vertical());
+		col.label(std.string(i + 1)).fixed_height(14).alignment("center");
+		// Normal option button: the two modes are items of a combo control, so the
+		// selection is a persistent state instead of a momentary button press.
+		mode_ctrl = col.controlcombo("H" + std.string(i + 1), "hold_" + b.id + "_" + std.string(i));
+		mode_ctrl.items(hold_mode_items).fixed_width(cell_w).fixed_height(hold_btn_h).hide_config_menu(true);
+		mode_ctrl.callback([b, i](v) {
+			set_hold_mode(b, i, std.int(v) == 1);
 		});
 		b.hold.push_back(false);
+		b.hmode.push_back(mode_ctrl);
+		mode_ctrl.value(0, false, false);
 		b.cells.push_back([item=col]);
 	}
 
@@ -92,11 +115,11 @@ rebuild_block(b) {
 	build_row(b, "fo", n);
 	build_row(b, "fi", n);
 
-	// Defaults for new cells
+	// Defaults for new cells: no fades at all (instant gate)
 	for(i = 0; i < n; i++) {
 		b.val[i].value(1.0);
-		b.fo[i].value(0.05);
-		b.fi[i].value(0.01);
+		b.fo[i].value(0.0);
+		b.fi[i].value(0.0);
 	}
 }
 
@@ -125,13 +148,13 @@ add_block(uid = -1) {
 
 	bid = "B" + uid;
 
-	b = [id=bid, uid=uid, num=blocks.size() + 1, val=[], fo=[], fi=[], hold=[], cells=[], prev_out=0.0, out=None, box=None, pending_remove=0];
+	b = [id=bid, uid=uid, num=blocks.size() + 1, val=[], fo=[], fi=[], hold=[], hmode=[], cells=[], prev_out=0.0, out=None, box=None, pending_remove=0];
 
 	block_box = block_list_area.collapsable("Output " + std.string(b.num)).expanded(true);
 	b.box = block_box;
 	inner = block_box.content().layout(nanogui.layout_vertical());
 
-	b.header_row = inner.widget().fixed_height(34).anchor_left(0).layout(nanogui.layout_horizontal());
+	b.header_row = inner.widget().fixed_height(header_h).anchor_left(0).layout(nanogui.layout_horizontal());
 
 	b.val_row = inner.widget().fixed_height(row_h).anchor_left(0).layout(nanogui.layout_horizontal());
 	b.fo_row = inner.widget().fixed_height(row_h).anchor_left(0).layout(nanogui.layout_horizontal());
@@ -177,6 +200,7 @@ flush_pending_rebuild() {
 		b.fo.clear();
 		b.fi.clear();
 		b.hold.clear();
+		b.hmode.clear();
 		blocks.erase(i);
 	}
 
@@ -367,7 +391,7 @@ load_state(state) {
 					b.val[i].value(rec.val[i]);
 					b.fo[i].value(rec.fo[i]);
 					b.fi[i].value(rec.fi[i]);
-					b.hold[i] = rec.hold[i];
+					set_hold_mode(b, i, rec.hold[i] ? true : false);
 				}
 			}
 			if(rec.has("out"))
