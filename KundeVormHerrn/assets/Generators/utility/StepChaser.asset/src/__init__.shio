@@ -18,9 +18,20 @@ steps_ctrl = None;     // number of steps (Zaehlzeiten) per bar
 bar_ctrl = None;       // bar length in beats
 
 // Block bookkeeping
-block_max = 0;
+// block_next_id is a MONOTONIC counter: it is never decremented, so control
+// ids / group names stay unique and the displayed numbering can never go
+// backwards or collide with an existing block after a removal.
+block_next_id = 0;
 blocks = [];           // list of block records (json)
 managed block_list_area = None;
+
+// Deferred teardown request.
+// IMPORTANT (crash / ghost-widget safety):
+//   No widget may be freed inside a callback of a widget that is currently
+//   dispatching an event - the free is ignored there and the block stays
+//   visible in the GUI. Removal therefore only marks the block (and stops its
+//   output right away); the real teardown runs at the top of update().
+pending_rebuild = false;
 
 // ---- Table cell layout constants ----
 cell_w = 70;           // width of a step cell (columns align across blocks)
@@ -89,13 +100,35 @@ rebuild_block(b) {
 	}
 }
 
+// Re-number the visible block containers consecutively (Output 1..N).
+// Uses the current position in the block list, so the numbering never goes
+// negative and never collides after a removal.
+renumber_blocks() {
+	for(i = 0; i < blocks.size(); i++) {
+		b = blocks[i];
+		b.num = i + 1;
+		if(b.box != None)
+			b.box.title("Output " + std.string(b.num));
+	}
+}
+
 // Add a new block (a table on the shared grid + its own output slider).
-add_block() {
-	bid = "B" + block_max;
+// uid = stable unique id -> the control group ("out_B<uid>") can never collide
+// with another block, even after removals. num = consecutive display number.
+add_block(uid = -1) {
+	if(uid < 0) {
+		uid = block_next_id;
+		block_next_id++;
+	}
+	else if(uid >= block_next_id)
+		block_next_id = uid + 1;
 
-	b = [id=bid, val=[], fo=[], fi=[], hold=[], cells=[], prev_out=0.0, out=None];
+	bid = "B" + uid;
 
-	block_box = block_list_area.collapsable("Output " + std.string(block_max + 1)).expanded(true);
+	b = [id=bid, uid=uid, num=blocks.size() + 1, val=[], fo=[], fi=[], hold=[], cells=[], prev_out=0.0, out=None, box=None, pending_remove=0];
+
+	block_box = block_list_area.collapsable("Output " + std.string(b.num)).expanded(true);
+	b.box = block_box;
 	inner = block_box.content().layout(nanogui.layout_vertical());
 
 	b.header_row = inner.widget().fixed_height(34).anchor_left(0).layout(nanogui.layout_horizontal());
@@ -106,17 +139,50 @@ add_block() {
 
 	b.rows = [header=b.header_row, val=b.val_row, fo=b.fo_row, fi=b.fi_row];
 
-	// Output slider (Regler) for this block
+	// Output slider (Regler) for this block.
+	// The control's full name is "Out@out_B<uid>" - the uid is never reused, so
+	// it stays globally unique inside the node and is never affected by the
+	// renumbering of the collapsable titles after a removal.
 	out_row = inner.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
 	inner.label("Value").fixed_width(cell_w);
-	out = out_row.controlslider("Out " + std.string(block_max + 1), "out_" + bid);
+	out = out_row.controlslider("Out", "out_" + bid);
 	out.min(0).max(1).value(0.0);
 	b.out = out;
 
 	rebuild_block(b);
 
 	blocks.push_back(b);
-	block_max++;
+}
+
+// Apply removals that were requested from button callbacks.
+// Called from update() only - no widget event is on the stack there, so
+// freeing the widgets actually works and the block disappears from the GUI.
+flush_pending_rebuild() {
+	if(pending_rebuild != true)
+		return;
+
+	for(i = blocks.size() - 1; i >= 0; i--) {
+		b = blocks[i];
+		if(b.pending_remove != 1)
+			continue;
+		// Free only the block's root container; it owns all child widgets
+		// (cells, sliders, rows). Freeing children AND the box double-frees
+		// and corrupts other blocks' controls.
+		if(b.box != None)
+			std.free(b.box);
+		b.box = None;
+		b.out = None;
+		b.cells.clear();
+		b.val.clear();
+		b.fo.clear();
+		b.fi.clear();
+		b.hold.clear();
+		blocks.erase(i);
+	}
+
+	block_list_area.refresh_layout();
+	renumber_blocks();
+	pending_rebuild = false;
 }
 
 entry(generator, area) {
@@ -142,26 +208,36 @@ entry(generator, area) {
 	});
 
 	add_btn.on_click([]() {
-		if(block_max < 8)
+		if(blocks.size() < 8)
 			add_block();
 	});
 
-	del_btn.on_click([blocks]() {
+	// REMOVE must NOT destroy widgets from inside its own click callback:
+	// the free is ignored there, so the block would stay visible in the GUI.
+	// Only mark + hide here; the actual teardown happens in flush_pending_rebuild().
+	del_btn.on_click([]() {
 		if(blocks.size() == 0)
 			return;
-		b = blocks.pop_back();
-		std.free(b.out);
-		for(i = 0; i < b.cells.size(); i++)
-			std.free(b.cells[i].item);
-		block_max--;
+		b = blocks[blocks.size() - 1];
+		if(b.pending_remove == 1)
+			return;
+		b.pending_remove = 1;
+		// Stop the output immediately so the removed value is no longer driven.
+		b.out = None;
+		b.prev_out = 0.0;
+		// Hide the whole block container right away (no widget free here).
+		if(b.box != None)
+			b.box.visible(false);
+		pending_rebuild = true;
 	});
 
 	// Default blocks
 	add_block();
-	add_block();
 }
 
 update(generator, tl_pos, pos_delta) {
+	flush_pending_rebuild();
+
 	n = steps_ctrl.value();
 	if(n < 1)
 		n = 1;
@@ -183,6 +259,10 @@ update(generator, tl_pos, pos_delta) {
 
 	for(bi = 0; bi < blocks.size(); bi++) {
 		b = blocks[bi];
+
+		// Defensive: skip blocks whose output control was removed / invalidated.
+		if(std.is_none(b.out))
+			continue;
 
 		// Guard against a block that has no cells (e.g. mid-rebuild)
 		if(b.val.size() <= step) {
@@ -242,7 +322,10 @@ save_state() {
 	state = [steps=steps_ctrl.value(), bar=bar_ctrl.value(), blocks=[]];
 	for(bi = 0; bi < blocks.size(); bi++) {
 		b = blocks[bi];
-		rec = [val=[], fo=[], fi=[], hold=[], out=b.out.value()];
+		if(b.pending_remove == 1)
+			continue;
+		out_val = (b.out != None) ? b.out.value() : 0.0;
+		rec = [uid=b.uid, val=[], fo=[], fi=[], hold=[], out=out_val];
 		for(i = 0; i < b.val.size(); i++) {
 			rec.val.push_back(b.val[i].value());
 			rec.fo.push_back(b.fo[i].value());
@@ -263,19 +346,22 @@ load_state(state) {
 		if(state.has("steps"))
 			steps_ctrl.value(state.steps);
 
-		// Tear down existing blocks
+		// Tear down existing blocks (free root container of each block)
 		for(bi = 0; bi < blocks.size(); bi++) {
 			b = blocks[bi];
-			for(i = 0; i < b.cells.size(); i++)
-				std.free(b.cells[i].item);
+			if(b.box != None)
+				std.free(b.box);
+			b.out = None;
 		}
 		blocks.clear();
-		block_max = 0;
+		block_list_area.refresh_layout();
+		block_next_id = 0;
+		pending_rebuild = false;
 
 		for(bi = 0; bi < state.blocks.size(); bi++) {
-			add_block();
-			b = blocks[blocks.size() - 1];
 			rec = state.blocks[bi];
+			add_block(rec.has("uid") ? rec.uid : -1);
+			b = blocks[blocks.size() - 1];
 			for(i = 0; i < rec.val.size(); i++) {
 				if(i < b.val.size()) {
 					b.val[i].value(rec.val[i]);
