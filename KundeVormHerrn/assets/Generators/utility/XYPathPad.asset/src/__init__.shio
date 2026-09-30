@@ -99,17 +99,49 @@ entry(generator, area) {
 	path_graph.grid(0.25);
 	path_graph.points([[0.25, 0.25, 0.0], [0.75, 0.25, 0.0], [0.75, 0.75, 0.0], [0.25, 0.75, 0.0]]);
 
-	// ---- Point role markers --------------------------------------------
+	// ---- Point role markers: registered at the END of entry() ----
+	// The on_draw overlay (green = first point, blue = last point in OPEN mode)
+	// is attached AFTER all controls are created, because it captures the
+	// path_graph AND the `shape` combo BY VALUE. Registering it here would
+	// capture `shape` while it is still None (it is assigned further below),
+	// making `shape.value()` raise "not a function" on the render thread. See
+	// the registration near the bottom of entry().
+
+	// ---- Path / travel controls ----
+	row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	travel = row.controlslider("Travel").min(0.25).max(16).value(2.0).fixed_width(110);
+	mode = row.controlcombo("Mode").fixed_width(110);
+	mode.items(["LOOP", "BOUNCE"]);
+	shape = row.controlcombo("Path").fixed_width(120);
+	shape.items(["CLOSED", "OPEN"]);
+
+	// ---- Input controls (linkable) ----
+	in_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	combine = in_row.controlcombo("Combine").fixed_width(90);
+	combine.items(["ADD", "SUB", "MUL"]);
+	in_x = in_row.controlslider("Input X").min(-1).max(1).value(0.0).fixed_width(150);
+	in_y = in_row.controlslider("Input Y").min(-1).max(1).value(0.0).fixed_width(150);
+
+	// ---- Output controls ----
+	out_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
+	out_x = out_row.controlslider("Output X").min(-1).max(1).value(0.0).fixed_width(150);
+	out_y = out_row.controlslider("Output Y").min(-1).max(1).value(0.0).fixed_width(150);
+
+	// ---- Point role markers (registered LAST) ----
 	// Overlay drawn on top of the graph's own handles:
-	//   first point  -> GREEN  (the start of the path)
-	//   last point   -> BLUE   (the end of the path)
-	// In CLOSED mode the path is looped, so there is no end point and only the
-	// start is highlighted.
+	//   first point  -> GREEN  (start of the path)
+	//   last point   -> BLUE   (end of the path, only in OPEN mode)
+	// In CLOSED mode the path is looped, so there is no distinct end point and
+	// no blue marker is drawn.
 	//
-	// NOTE: on_draw runs on the render thread, where the asset module GLOBAL
-	// scope is not active. Everything needed must be reference-captured into
-	// this closure and no module global helper functions may be called.
-	path_graph.on_draw([&path_graph, &shape]() {
+	// Registered at the END of entry() so `shape` already exists. The handles
+	// (path_graph + shape) are captured BY VALUE: the closure owns its own live
+	// reference, so it survives widget destruction (the render thread may keep
+	// invoking on_draw after the module globals are reset) AND it never sees a
+	// stale/None `shape`. Capturing by value here is required because this runs
+	// on the render thread where the module global scope is not active, and
+	// no module-global helper functions may be called.
+	path_graph.on_draw([path_graph, shape]() {
 		pts = path_graph.points();
 		n = pts.size();
 		sz = path_graph.size();
@@ -136,26 +168,6 @@ entry(generator, area) {
 			}
 		}
 	});
-
-	// ---- Path / travel controls ----
-	row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
-	travel = row.controlslider("Travel").min(0.25).max(16).value(2.0).fixed_width(110);
-	mode = row.controlcombo("Mode").fixed_width(110);
-	mode.items(["LOOP", "BOUNCE"]);
-	shape = row.controlcombo("Path").fixed_width(120);
-	shape.items(["CLOSED", "OPEN"]);
-
-	// ---- Input controls (linkable) ----
-	in_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
-	combine = in_row.controlcombo("Combine").fixed_width(90);
-	combine.items(["ADD", "SUB", "MUL"]);
-	in_x = in_row.controlslider("Input X").min(-1).max(1).value(0.0).fixed_width(150);
-	in_y = in_row.controlslider("Input Y").min(-1).max(1).value(0.0).fixed_width(150);
-
-	// ---- Output controls ----
-	out_row = area.widget().fixed_height(24).anchor_left(0).anchor_right(0).layout(nanogui.layout_horizontal());
-	out_x = out_row.controlslider("Output X").min(-1).max(1).value(0.0).fixed_width(150);
-	out_y = out_row.controlslider("Output Y").min(-1).max(1).value(0.0).fixed_width(150);
 }
 
 update(generator, tl_pos, pos_delta) {
